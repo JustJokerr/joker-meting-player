@@ -272,72 +272,82 @@ class JokerMetingPlayer {
      * PHP 服务端代理请求 API（
      */
     public function ajax_proxy() {
-        $opts = $this->get_options();
-        
-        if (empty($opts['playlist_id'])) {
-            wp_send_json_error(['msg' => '歌单ID不能为空'], 400);
-        }
-
-        // 构建目标 API URL
-        $api_base = rtrim(trim($opts['custom_api']), '?&/');
-        $api_url = $api_base . '?' . http_build_query([
-            'server' => $opts['server'],
-            'type'   => $opts['type'],
-            'id'     => $opts['playlist_id']
-        ]);
-
-        $headers = [
-            'Accept'     => 'application/json',
-            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 WordPress/JokerPlayer'
-        ];
-
-        //cookie
-        if ($opts['vip_mode'] === 'on' && !empty($opts['cookie'])) {
-            $clean_cookie = '';
-            $cookie_parts = explode(';', $opts['cookie']);
-            foreach ($cookie_parts as $part) {
-                if (strpos(trim($part), 'MUSIC_U=') === 0) {
-                    $clean_cookie = trim($part);
-                    break;
-                }
-            }
-            $headers['Cookie'] = $clean_cookie ? $clean_cookie : trim($opts['cookie']);
-        }
-
-        //生成唯一缓存 Key
-        $cache_key = 'joker_player_api_' . md5($api_url . (isset($headers['Cookie']) ? $headers['Cookie'] : ''));
-        
-        // 尝试命中缓存，避免频繁请求导致上游封禁IP
-        $cached_data = get_transient($cache_key);
-        if ($cached_data !== false) {
-            wp_send_json_success($cached_data);
-            exit;
-        }
-
-        // 使用 WordPress HTTP API 发起真实请求
-        $response = wp_remote_get($api_url, [
-            'timeout'   => 15,
-            'sslverify' => false,
-            'headers'   => $headers
-        ]);
-
-        if (is_wp_error($response)) {
-            wp_send_json_error(['msg' => 'API请求失败：' . $response->get_error_message()], 500);
-        }
-
-        $status = wp_remote_retrieve_response_code($response);
-        $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
-
-        if ($status !== 200 || json_last_error() !== JSON_ERROR_NONE) {
-            wp_send_json_error(['msg' => 'API返回无效数据或服务不可用', 'status' => $status], $status);
-        }
-
-        // 将成功获取的最新数据缓存 1 小时
-        set_transient($cache_key, $data, 3600);
-
-        wp_send_json_success($data);
+    $opts = $this->get_options();
+    
+    if (empty($opts['playlist_id'])) {
+        wp_send_json_error(['msg' => '歌单ID不能为空'], 400);
     }
+
+    $api_base = rtrim(trim($opts['custom_api']), '?&/');
+    $api_url = $api_base . '?' . http_build_query([
+        'server' => $opts['server'],
+        'type'   => $opts['type'],
+        'id'     => $opts['playlist_id'],
+        'r'      => rand(1000,9999) // 新增：防缓存，确保获取最新歌词
+    ]);
+
+    $headers = [
+        'Accept'     => 'application/json',
+        'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 WordPress/JokerPlayer'
+    ];
+
+    if ($opts['vip_mode'] === 'on' && !empty($opts['cookie'])) {
+        $clean_cookie = '';
+        $cookie_parts = explode(';', $opts['cookie']);
+        foreach ($cookie_parts as $part) {
+            if (strpos(trim($part), 'MUSIC_U=') === 0) {
+                $clean_cookie = trim($part);
+                break;
+            }
+        }
+        $headers['Cookie'] = $clean_cookie ? $clean_cookie : trim($opts['cookie']);
+    }
+
+    $cache_key = 'joker_player_api_' . md5($api_url . (isset($headers['Cookie']) ? $headers['Cookie'] : ''));
+    $cached_data = get_transient($cache_key);
+    if ($cached_data !== false) {
+        wp_send_json_success($cached_data);
+        exit;
+    }
+
+    $response = wp_remote_get($api_url, [
+        'timeout'   => 15,
+        'sslverify' => false,
+        'headers'   => $headers
+    ]);
+
+    if (is_wp_error($response)) {
+        wp_send_json_error(['msg' => 'API请求失败：' . $response->get_error_message()], 500);
+    }
+
+    $status = wp_remote_retrieve_response_code($response);
+    $body = wp_remote_retrieve_body($response);
+    $data = json_decode($body, true);
+
+    if ($status !== 200 || json_last_error() !== JSON_ERROR_NONE) {
+        wp_send_json_error(['msg' => 'API返回无效数据或服务不可用', 'status' => $status], $status);
+    }
+
+    // 新增：确保每个音频项都有lrc字段（原始歌词文本）
+    foreach ($data as &$item) {
+        if (empty($item['lrc']) && !empty($item['url'])) {
+            // 兜底：如果没有lrc，尝试从接口补充
+            $lrc_url = $api_base . '?' . http_build_query([
+                'server' => $opts['server'],
+                'type'   => 'lrc',
+                'id'     => $item['id']
+            ]);
+            $lrc_response = wp_remote_get($lrc_url, ['timeout' => 5, 'sslverify' => false]);
+            if (!is_wp_error($lrc_response) && wp_remote_retrieve_response_code($lrc_response) === 200) {
+                $item['lrc'] = wp_remote_retrieve_body($lrc_response);
+            }
+        }
+    }
+
+    set_transient($cache_key, $data, 3600);
+    wp_send_json_success($data);
+}
+
 
     /**
      * 注册后台菜单
@@ -377,319 +387,294 @@ class JokerMetingPlayer {
      * 动态核心引擎 CSS 生成
      * 包含：四维定位、DOM强行介入、移动端视口自适应等超大规模算法
      */
-    private function generate_player_styles($opts) {
-        $lrc_size = (int)$opts['lrc_size'];
-        if ($lrc_size < 12) $lrc_size = 12;
+private function generate_player_styles($opts) {
+    $lrc_size = (int)$opts['lrc_size'];
+    // 仅保留可视行数优化（5行），不干预滚动逻辑
+    $lrc_line_height = $lrc_size * 1;
+    $lrc_visible_lines = 5; 
+    $lrc_container_height = $lrc_line_height * $lrc_visible_lines + 20;
 
-        // 计算歌词容器总高度，防止任何情况的截断
-        $lrc_line_height = $lrc_size * 1.5;
-        $lrc_container_height = $lrc_line_height * 3 + 20;
+    $pos = $opts['position'];
+    $is_right = strpos($pos, 'right') !== false;
+    $is_top = strpos($pos, 'top') !== false;
 
-        // 方位状态标识
-        $pos = $opts['position'];
-        $is_right = strpos($pos, 'right') !== false;
-        $is_top = strpos($pos, 'top') !== false;
+    $lrc_pos = $opts['lrc_pos'];
+    $lrc_top_val = 'auto';
+    $lrc_bottom_val = 'auto';
 
-        // 根据播放器位置，计算歌词容器的安全避让距离
-        $lrc_pos = $opts['lrc_pos'];
-        $lrc_top_val = 'auto';
-        $lrc_bottom_val = 'auto';
-
-        if ($lrc_pos === 'top') {
-            // 用户想把歌词放在网页顶端
-            $lrc_top_val = $is_top ? '75px' : '15px'; // 如果播放器也在顶端，必须下移75px避开播放器
-        } else {
-            // 用户想把歌词放在网页底端
-            $lrc_bottom_val = (!$is_top) ? '75px' : '15px'; // 如果播放器也在底端，必须上移75px避开播放器
-        }
-
-        // 色彩配置装载
-        $day_vars = "
-            --jk-pri: {$opts['c_primary']};
-            --jk-bg: {$opts['c_bg']};
-            --jk-l-bg: {$opts['c_list_bg']};
-            --jk-l-cur: {$opts['c_list_cur_bg']};
-            --jk-lrc: {$opts['c_lrc']};
-            --jk-lrc-h: {$opts['c_lrc_hl']};
-            --jk-bor: {$opts['c_border']};
-            --jk-txt: {$opts['c_text']};
-        ";
-        $night_vars = "
-            --jk-pri: {$opts['n_primary']};
-            --jk-bg: {$opts['n_bg']};
-            --jk-l-bg: {$opts['n_list_bg']};
-            --jk-l-cur: {$opts['n_list_cur_bg']};
-            --jk-lrc: {$opts['n_lrc']};
-            --jk-lrc-h: {$opts['n_lrc_hl']};
-            --jk-bor: {$opts['n_border']};
-            --jk-txt: {$opts['n_text']};
-        ";
-
-        $css = ".joker-player-context { {$day_vars} }\n";
-
-        // 夜间模式接管
-        if ($opts['night_mode'] === 'always') {
-            $css = ".joker-player-context { {$night_vars} }\n";
-        } elseif ($opts['night_mode'] === 'auto') {
-            $css .= "@media (prefers-color-scheme: dark) { .joker-player-context { {$night_vars} } }\n";
-        } elseif ($opts['night_mode'] === 'time') {
-            $css .= "body.joker-night-active .joker-player-context { {$night_vars} }\n";
-        }
-
-        $css .= "
-            .joker-player-context .aplayer, .joker-player-context .aplayer * { box-sizing: content-box ; }
-            .joker-player-context .aplayer svg { max-width: none ; max-height: none ; display: block ; width: 100% ; height: 100% ; }
-            .joker-player-context .aplayer { background: var(--jk-bg) ; color: var(--jk-txt) ; border-color: var(--jk-bor) ; box-shadow: 0 4px 12px rgba(0,0,0,0.15) ; z-index: 99999 ; }
-            .joker-player-context .aplayer .aplayer-body { background: var(--jk-bg) ; }
-            .joker-player-context .aplayer .aplayer-info { border-bottom: 1px solid var(--jk-bor) ; }
-            .joker-player-context .aplayer .aplayer-list { background: var(--jk-l-bg) ; }
-            .joker-player-context .aplayer .aplayer-list ol li { border-top: 1px solid var(--jk-bor) ; color: var(--jk-txt) ; }
-            .joker-player-context .aplayer .aplayer-list ol li:hover { background: var(--jk-l-cur) ; }
-            .joker-player-context .aplayer .aplayer-list ol li.aplayer-list-light { background: var(--jk-l-cur) ; border-left-color: var(--jk-pri) ; }
-            .joker-player-context .aplayer .aplayer-list ol li.aplayer-list-light .aplayer-list-title { color: var(--jk-pri) ; font-weight: bold; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time { color: var(--jk-txt) ; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon { display: inline-block ; width: 15px ; height: 15px ; opacity: 0.8 ; pointer-events: auto ; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon:hover { opacity: 1 ; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon path { fill: var(--jk-txt) ; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon:hover path { fill: var(--jk-pri) ; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-bar-wrap .aplayer-bar .aplayer-loaded { background: var(--jk-bor) ; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-bar-wrap .aplayer-bar .aplayer-played { background: var(--jk-pri) ; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-bar-wrap .aplayer-bar .aplayer-thumb { background: var(--jk-pri) ; border-color: var(--jk-pri) ; }
-            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-volume-wrap .aplayer-volume-bar-wrap .aplayer-volume-bar .aplayer-volume-filled { background: var(--jk-pri) ; }
-            
-            /* 歌词区算法引擎 (避让逻辑) - 修复pointer-events，仅禁用歌词文本点击，保留按钮交互 */
-            .joker-player-context .aplayer.aplayer-fixed .aplayer-lrc { 
-                background: transparent ; pointer-events: auto ; text-align: center ; margin: 0 ; padding: 10px 0 ;
-                height: {$lrc_container_height}px ; 
-                top: {$lrc_top_val} ; 
-                bottom: {$lrc_bottom_val} ;
-                left: 0 ; right: 0 ; /* 强制水平居中 */
-                z-index: 99997 ; /* 低于播放器主体，避免遮挡按钮 */
-            }
-            .joker-player-context .aplayer .aplayer-lrc p { 
-                color: var(--jk-lrc) ; font-size: {$lrc_size}px ; line-height: {$lrc_line_height}px ; min-height: {$lrc_line_height}px ;
-                background: transparent ; text-shadow: 1px 1px 3px rgba(0,0,0,0.5) ; filter: blur(0.5px); opacity: 0.8; transition: all 0.5s ease-out ;
-                pointer-events: none ; /* 仅禁用歌词文本点击 */
-            }
-            .joker-player-context .aplayer .aplayer-lrc p.aplayer-lrc-current { color: var(--jk-lrc-h) ; opacity: 0.85; filter: none; transform: scale(1.15) ; font-weight: 800; }
-        ";
-
-        // APlayer 默认是 left 和 bottom 结构
-        
-        // 处理右侧 (Right)
-        if ($is_right) {
-            $css .= "
-                /* 将父级容器移动到右侧 */
-                .joker-player-context .aplayer.aplayer-fixed { right: 0 ; left: auto ; }
-                /* 播放器主体锁定至右侧 */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-body { right: 0 ; left: auto ; transition: right 0.3s ease ; }
-                /* 窄体折叠模式 (原版往左缩，现修改为往右隐藏) */
-                .joker-player-context .aplayer.aplayer-fixed.aplayer-narrow .aplayer-body { right: -66px ; left: auto ; }
-                /* 将侧边唤醒按钮平移至播放器左侧，并做水平翻转 */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-miniswitch { 
-                    right: auto ; left: -18px ; 
-                    border-radius: 4px 0 0 4px ; 
-                    pointer-events: auto ; /* 确保按钮可点击 */
-                }
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-miniswitch .aplayer-icon { transform: rotateY(180deg) ; }
-                /* 列表展开锁定右侧对齐 */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list { right: 0 ; left: auto ; }
-            ";
-        }
-
-        // 处理顶部 (Top)
-        if ($is_top) {
-            $css .= "
-                /* 父级吸顶 - 提升层级避免遮挡 */
-                .joker-player-context .aplayer.aplayer-fixed { 
-                    top: 0 ; bottom: auto ; 
-                    z-index: 99999 ; /* 强制最高层级 */
-                }
-                /* 播放器主体锁定至顶部 */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-body { 
-                    top: 0 ; bottom: auto ; 
-                    z-index: 99999 ; /* 主体层级独立 */
-                }
-                /* 列表改为向下展开 - 修复遮挡+空白问题 (核心：top设为66px+10px偏移，避免被播放器遮挡) */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list { 
-                    top: 76px ; bottom: auto ; 
-                    border-top: 1px solid var(--jk-bor) ; border-bottom: 1px solid var(--jk-bor) ; 
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.15) ;
-                    z-index: 99998 ; /* 列表层级略低于主体但高于其他元素 */
-                    max-height: 300px ; /* 限制列表最大高度，避免空白 */
-                    overflow-y: auto ; /* 超出高度滚动，消除空白 */
-                    margin: 76px 0 0 0; /* 移除默认margin导致的空白 */
-                    /* 增加内边距，确保首行内容不被遮挡 */
-                    padding: 0 ;
-                }
-                /* 修复顶部列表内部空白 */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol {
-                    margin: 0 ;
-                    padding: 0 ;
-                }
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol li {
-                    padding: 8px 12px ; /* 精准控制内边距，避免空白 */
-                    white-space: nowrap ;
-                    overflow: hidden ;
-                    text-overflow: ellipsis ;
-                }
-            ";
-        } else {
-            // 底部的默认避让
-            $css .= "
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list { 
-                    bottom: 76px ; top: auto ; 
-                    border-bottom: 1px solid var(--jk-bor) ; border-top: 1px solid var(--jk-bor) ;
-                    max-height: 300px ; /* 统一限制高度，避免空白 */
-                    overflow-y: auto ;
-                    margin: 0 0 76px 0;
-                    /* 增加内边距，确保末行内容不被遮挡 */
-                    padding: 0 ;
-                }
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol {
-                    margin: 0 ;
-                    padding: 0 ;
-                }
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol li {
-                    padding: 8px 12px ;
-                    white-space: nowrap ;
-                    overflow: hidden ;
-                    text-overflow: ellipsis ;
-                }
-            ";
-        }
-
-        // 当视口宽度小于 768px 时介入
-        $css .= "
-            @media (max-width: 768px) {
-                /* 解除固定宽度限制，确保父级可以横跨屏幕 */
-                .joker-player-context .aplayer.aplayer-fixed { max-width: 100vw ; width: 100% ; }
-                
-                /* 强制歌单列表全屏宽度显示，防止在右上、右下模式时超出屏幕左侧边界 */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list { 
-                    position: fixed ; 
-                    left: 0 ; right: 0 ; 
-                    width: 100vw ; max-width: 100vw ;
-                    max-height: 300px; /* 移动端适配高度，避免空白 */
-                    overflow-y: auto ;
-                    margin: 0 ;
-                    /* 移动端列表偏移修复 */
-                    " . ($is_top ? "top: 76px ;" : "bottom: 76px ;") . "
-                    " . ($is_top ? "margin-top: 76px;" : "margin-bottom: 76px ;") . "
-                    padding:0 ;
-                }
-                
-                /* 柔性计算：自动按 0.75 比例缩小歌词尺寸，防止大字号占用全屏。同时设置最小兜底尺寸 13px */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-lrc p {
-                    font-size: max(13px, calc({$lrc_size}px * 0.75)) ;
-                    line-height: max(20px, calc({$lrc_line_height}px * 0.75)) ;
-                    min-height: max(20px, calc({$lrc_line_height}px * 0.75)) ;
-                }
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-lrc {
-                    height: max(70px, calc({$lrc_container_height}px * 0.75)) ;
-                    padding: 5px 0 ;
-                }
-                
-                /* 移动端列表项优化，消除空白 */
-                .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol li {
-                    padding: 6px 10px ;
-                    font-size: 14px ;
-                }
-                
-                /* 移动端按钮交互修复 */
-                .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon {
-                    pointer-events: auto ;
-                }
-            }
-        ";
-        return $css;
+    if ($lrc_pos === 'top') {
+        $lrc_top_val = $is_top ? '75px' : '15px';
+    } else {
+        $lrc_bottom_val = (!$is_top) ? '75px' : '15px';
     }
+
+    $day_vars = "
+        --jk-pri: {$opts['c_primary']};
+        --jk-bg: {$opts['c_bg']};
+        --jk-l-bg: {$opts['c_list_bg']};
+        --jk-l-cur: {$opts['c_list_cur_bg']};
+        --jk-lrc: {$opts['c_lrc']};
+        --jk-lrc-h: {$opts['c_lrc_hl']};
+        --jk-bor: {$opts['c_border']};
+        --jk-txt: {$opts['c_text']};
+    ";
+    $night_vars = "
+        --jk-pri: {$opts['n_primary']};
+        --jk-bg: {$opts['n_bg']};
+        --jk-l-bg: {$opts['n_list_bg']};
+        --jk-l-cur: {$opts['n_list_cur_bg']};
+        --jk-lrc: {$opts['n_lrc']};
+        --jk-lrc-h: {$opts['n_lrc_hl']};
+        --jk-bor: {$opts['n_border']};
+        --jk-txt: {$opts['n_text']};
+    ";
+
+    $css = ".joker-player-context { {$day_vars} }\n";
+
+    if ($opts['night_mode'] === 'always') {
+        $css = ".joker-player-context { {$night_vars} }\n";
+    } elseif ($opts['night_mode'] === 'auto') {
+        $css .= "@media (prefers-color-scheme: dark) { .joker-player-context { {$night_vars} } }\n";
+    } elseif ($opts['night_mode'] === 'time') {
+        $css .= "body.joker-night-active .joker-player-context { {$night_vars} }\n";
+    }
+
+    $css .= "
+        .joker-player-context .aplayer, .joker-player-context .aplayer * { box-sizing: content-box ; }
+        .joker-player-context .aplayer svg { max-width: none ; max-height: none ; display: block ; width: 100% ; height: 100% ; }
+        .joker-player-context .aplayer { background: var(--jk-bg) ; color: var(--jk-txt) ; border-color: var(--jk-bor) ; box-shadow: 0 4px 12px rgba(0,0,0,0.15) ; z-index: 99999 ; }
+        .joker-player-context .aplayer .aplayer-body { background: var(--jk-bg) ; }
+        .joker-player-context .aplayer .aplayer-info { border-bottom: 1px solid var(--jk-bor) ; }
+        .joker-player-context .aplayer .aplayer-list { background: var(--jk-l-bg) ; }
+        .joker-player-context .aplayer .aplayer-list ol li { border-top: 1px solid var(--jk-bor) ; color: var(--jk-txt) ; }
+        .joker-player-context .aplayer .aplayer-list ol li:hover { background: var(--jk-l-cur) ; }
+        .joker-player-context .aplayer .aplayer-list ol li.aplayer-list-light { background: var(--jk-l-cur) ; border-left-color: var(--jk-pri) ; }
+        .joker-player-context .aplayer .aplayer-list ol li.aplayer-list-light .aplayer-list-title { color: var(--jk-pri) ; font-weight: bold; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time { color: var(--jk-txt) ; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon { display: inline-block ; width: 15px ; height: 15px ; opacity: 0.8 ; pointer-events: auto ; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon:hover { opacity: 1 ; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon path { fill: var(--jk-txt) ; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon:hover path { fill: var(--jk-pri) ; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-bar-wrap .aplayer-bar .aplayer-loaded { background: var(--jk-bor) ; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-bar-wrap .aplayer-bar .aplayer-played { background: var(--jk-pri) ; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-bar-wrap .aplayer-bar .aplayer-thumb { background: var(--jk-pri) ; border-color: var(--jk-pri) ; }
+        .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-volume-wrap .aplayer-volume-bar-wrap .aplayer-volume-bar .aplayer-volume-filled { background: var(--jk-pri) ; }
+        
+        /* 仅保留样式优化，完全交给APlayer官方处理滚动 */
+        .joker-player-context .aplayer.aplayer-fixed .aplayer-lrc { 
+            background: transparent; text-align: center ;
+            height: {$lrc_container_height}px ; 
+            top: {$lrc_top_val} ; 
+            bottom: {$lrc_bottom_val} ;
+            left: 0 ; right: 0 ; 
+            z-index: 99997 ; 
+            /* 恢复APlayer官方默认滚动行为 */
+            scroll-behavior: smooth ;
+            overflow-y: auto ;
+        }
+        .aplayer-lrc { 
+            pointer-events: none !important
+        }           
+        .joker-player-context .aplayer.aplayer-fixed .aplayer-lrc::-webkit-scrollbar { display: none ; }
+        .joker-player-context .aplayer .aplayer-lrc p { 
+            color: var(--jk-lrc) ; font-size: {$lrc_size}px ; line-height: {$lrc_line_height}px !important;
+            background: transparent ; text-shadow: 1px 1px 3px rgba(0,0,0,0.5) ; filter: blur(0.5px); opacity: 0.8; transition: all 0.3s ease-out ;
+        }
+        .joker-player-context .aplayer .aplayer-lrc p.aplayer-lrc-current { 
+            color: var(--jk-lrc-h) ; opacity: 0.85; filter: none; transform: scale(1.15) ; font-weight: 800;
+        }
+    ";
+
+    if ($is_right) {
+        $css .= "
+            .joker-player-context .aplayer.aplayer-fixed { right: 0 ; left: auto ; }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-body { right: 0 ; left: auto ; transition: right 0.3s ease ; }
+            .joker-player-context .aplayer.aplayer-fixed.aplayer-narrow .aplayer-body { right: -66px ; left: auto ; }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-miniswitch { 
+                right: auto ; left: -18px ; 
+                border-radius: 4px 0 0 4px ; 
+                pointer-events: auto ; 
+            }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-miniswitch .aplayer-icon { transform: rotateY(180deg) ; }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list { right: 0 ; left: auto ; }
+        ";
+    }
+
+    if ($is_top) {
+        $css .= "
+            .joker-player-context .aplayer.aplayer-fixed { 
+                top: 0 ; bottom: auto ; 
+                z-index: 99999 ; 
+            }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-body { 
+                top: 0 ; bottom: auto ; 
+                z-index: 99999 ; 
+            }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list { 
+                top: 76px ; bottom: auto ; 
+                border-top: 1px solid var(--jk-bor) ; border-bottom: 1px solid var(--jk-bor) ; 
+                box-shadow: 0 4px 12px rgba(0,0,0,0.15) ;
+                z-index: 99998 ; 
+                max-height: 300px ; 
+                overflow-y: auto ; 
+                margin: 76px 0 0 0; 
+                padding: 0 ;
+            }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol {
+                margin: 0 ;
+                padding: 0 ;
+            }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol li {
+                padding: 8px 12px ; 
+                white-space: nowrap ;
+                overflow: hidden ;
+                text-overflow: ellipsis ;
+            }
+        ";
+    } else {
+        $css .= "
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list { 
+                bottom: 76px ; top: auto ; 
+                border-bottom: 1px solid var(--jk-bor) ; border-top: 1px solid var(--jk-bor) ;
+                max-height: 300px ; 
+                overflow-y: auto ;
+                margin: 0 0 76px 0;
+                padding: 0 ;
+            }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol {
+                margin: 0 ;
+                padding: 0 ;
+            }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol li {
+                padding: 8px 12px ;
+                white-space: nowrap ;
+                overflow: hidden ;
+                text-overflow: ellipsis ;
+            }
+        ";
+    }
+
+    $css .= "
+        @media (max-width: 768px) {
+            .joker-player-context .aplayer.aplayer-fixed { max-width: 100vw ; width: 100% ; }
+            
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list { 
+                position: fixed ; 
+                left: 0 ; right: 0 ; 
+                width: 100vw ; max-width: 100vw ;
+                max-height: 300px; 
+                overflow-y: auto ;
+                margin: 0 ;
+                " . ($is_top ? "top: 76px ;" : "bottom: 76px ;") . "
+                padding:0 ;
+            }
+            
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-lrc p {
+                font-size:  calc({$lrc_size}px * 0.75) ;
+                line-height: calc({$lrc_line_height}px * 0.75) ;
+            }
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-lrc {
+                height:  calc({$lrc_container_height}px * 0.75) ;
+                padding: 5px 0 ;
+            }
+            
+            .joker-player-context .aplayer.aplayer-fixed .aplayer-list ol li {
+                padding: 6px 10px ;
+                font-size: 14px ;
+            }
+            
+            .joker-player-context .aplayer .aplayer-info .aplayer-controller .aplayer-time .aplayer-icon {
+                pointer-events: auto ;
+            }
+        }
+    ";
+    return $css;
+}
+
 
     /**
      * 前台播放器渲染与 JS 逻辑
      */
-    public function render_player() {
-        $opts = $this->get_options();
-        if (empty($opts['playlist_id'])) return;
-
-        // 真实 API 参数映射
-        $play_order = $opts['play_order'];
-        $ap_loop = 'all';
+public function render_player() {
+    $opts = $this->get_options();
+    if (empty($opts['playlist_id'])) return;
+        
+    $lrc_size = (int)$opts['lrc_size'];
+    $play_order = $opts['play_order'];
+    $ap_loop = 'all';
+    $ap_order = 'list';
+    
+    if ($play_order === 'single') {
+        $ap_loop = 'one';
         $ap_order = 'list';
-        
-        if ($play_order === 'single') {
-            $ap_loop = 'one';
-            $ap_order = 'list';
-        } elseif ($play_order === 'random') {
-            $ap_loop = 'all';
-            $ap_order = 'random';
-        }
-
-        echo "<!-- Joker Player UI Render Start -->\n";
-        echo "<div class='joker-player-context'>\n";
-        echo "  <div id='joker-player-instance'></div>\n";
-        echo "</div>\n";
-        
-        ?>
-        <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            console.log('Joker Player: 进程初始化中... (V1.4.0 四维自适应版)');
-            
-            // 守护进程加载 APlayer 类库 - 增加加载超时容错
-            let aplayerLoadTimer = setInterval(() => {
-                if (typeof window.APlayer !== 'undefined') {
-                    clearInterval(aplayerLoadTimer);
-                    
-                    fetch('<?php echo admin_url('admin-ajax.php'); ?>?action=joker_player_proxy', {
-                        method: 'GET',
-                        cache: 'no-cache',
-                        headers: { 'X-Requested-With': 'XMLHttpRequest' }
-                    })
-                    .then(response => {
-                        if (!response.ok) throw new Error('接口响应失败：' + response.status);
-                        return response.json();
-                    })
-                    .then(result => {
-                        if (result.success && result.data && result.data.length > 0) {
-                            console.log('Joker Player: 源挂载完毕，共载入曲目：', result.data.length);
-                            
-                            const playerContainer = document.getElementById('joker-player-instance');
-                            if (!playerContainer) return;
-                            
-                            const ap = new APlayer({
-                                container: playerContainer,
-                                fixed: true,
-                                autoplay: false,
-                                volume: <?php echo floatval($opts['default_volume'])/100; ?>,
-                                theme: '<?php echo esc_js($opts['c_primary']); ?>',
-                                loop: '<?php echo esc_js($ap_loop); ?>',
-                                order: '<?php echo esc_js($ap_order); ?>',
-                                listFolded: true,
-                                listMaxHeight: 300, // 显式设置列表最大高度
-                                lrcType: 3,
-                                audio: result.data
-                            });
-                        } else {
-                            throw new Error(result.data?.msg || '源解析空数据');
-                        }
-                    })
-                    .catch(error => console.error('Joker Player 底层错误：', error));
-                }
-            }, 200);
-
-            // 超时清理定时器，避免内存泄漏
-            setTimeout(() => {
-                if (typeof window.APlayer === 'undefined') {
-                    clearInterval(aplayerLoadTimer);
-                    console.error('Joker Player: APlayer 加载超时，请检查CDN链接');
-                }
-            }, 10000);
-        });
-        </script>
-        <?php
-
-        $this->inject_frontend_scripts($opts);
+    } elseif ($play_order === 'random') {
+        $ap_loop = 'all';
+        $ap_order = 'random';
     }
+
+    echo "<!-- Joker Player UI Render Start -->\n";
+    echo "<div class='joker-player-context'>\n";
+    echo "  <div id='joker-player-instance'></div>\n";
+    echo "</div>\n";
+    
+    ?>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        console.log('Joker Player: 进程初始化中... (纯官方文档版)');
+        let aplayerLoadTimer = setInterval(() => {
+            if (typeof window.APlayer !== 'undefined') {
+                clearInterval(aplayerLoadTimer);
+                
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>?action=joker_player_proxy', {
+                    method: 'GET',
+                    cache: 'no-cache',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                })
+                .then(response => {
+                    if (!response.ok) throw new Error('接口响应失败：' + response.status);
+                    return response.json();
+                })
+                .then(result => {
+                    if (result.success && result.data && result.data.length > 0) {
+                        console.log('Joker Player: 源挂载完毕，共载入曲目：', result.data.length);
+                        
+                        const playerContainer = document.getElementById('joker-player-instance');
+                        if (!playerContainer) return;
+                        
+                        // 100% 官方文档配置：lrcType:3（自动解析）
+                        const ap = new APlayer({
+                            container: playerContainer,
+                            fixed: true,
+                            autoplay: false,
+                            volume: <?php echo floatval($opts['default_volume'])/100; ?>,
+                            theme: '<?php echo esc_js($opts['c_primary']); ?>',
+                            loop: '<?php echo esc_js($ap_loop); ?>',
+                            order: '<?php echo esc_js($ap_order); ?>',
+                            listFolded: true,
+                            listMaxHeight: 300,
+                            lrcType: 3, // 官方文档明确支持
+                            audio: result.data
+                        });
+                    } else {
+                        throw new Error(result.data?.msg || '源解析空数据');
+                    }
+                })
+                .catch(error => console.error('Joker Player 底层错误：', error));
+            }
+        }, 200);
+
+        setTimeout(() => {
+            if (typeof window.APlayer === 'undefined') {
+                clearInterval(aplayerLoadTimer);
+                console.error('Joker Player: APlayer 加载超时，请检查CDN链接');
+            }
+        }, 10000);
+    });
+    </script>
+    <?php
+
+    $this->inject_frontend_scripts($opts);
+}
 
     /**
      * 注入前端夜间模式监听逻辑
@@ -830,7 +815,7 @@ class JokerMetingPlayer {
                                 </div>
                                 <div class="j-field">
                                     <label>歌词字体大小 (px)</label>
-                                    <input type="number" min="12" max="30" name="joker_player_options[lrc_size]" value="<?php echo esc_attr($opts['lrc_size']); ?>">
+                                    <input type="number" min="0" max="30" name="joker_player_options[lrc_size]" value="<?php echo esc_attr($opts['lrc_size']); ?>">
                                 </div>
                             </div>
                             <div class="j-field">
